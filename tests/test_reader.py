@@ -507,6 +507,253 @@ def test_duplicate_eof_markers_without_startxref(pdf_data):
         PdfReader(BytesIO(pdf_data))
 
 
+def _blank_pdf(pages: int = 3) -> bytes:
+    writer = PdfWriter()
+    for _ in range(pages):
+        writer.add_blank_page(72, 72)
+    buffer = BytesIO()
+    writer.write(buffer)
+    return buffer.getvalue()
+
+
+def _pdf_with_truncated_tail() -> bytes:
+    """Class 1: the tail is truncated inside the xref table.
+
+    No xref table, trailer, startxref pointer or %%EOF marker survives;
+    all indirect objects (including the catalog) are still present.
+    """
+    data = _blank_pdf()
+    xref_pos = data.find(b"xref\n")
+    assert xref_pos > 0
+    return data[: xref_pos + 20]
+
+
+def _pdf_with_startxref_beyond_eof() -> bytes:
+    """Class 1 variant: the tail is intact but the startxref offset
+    points beyond the end of the file.
+    """
+    data = _blank_pdf()
+    tail_pos = data.rfind(b"startxref")
+    assert tail_pos > 0
+    nl = data.find(b"\n", tail_pos)
+    end = data.find(b"\n", nl + 1)
+    return data[: nl + 1] + str(len(data) + 100000).encode() + data[end:]
+
+
+def _pdf_with_broken_xref_offsets() -> bytes:
+    """Class 2: two revisions; the last (full-rewrite) xref table carries
+    wrong offsets for every object. All objects can still be located in
+    the file via their ``N 0 obj`` headers; the live revision has 4 pages.
+    """
+    out = BytesIO()
+    out.write(b"%PDF-1.4\n")
+    offsets = {}
+
+    def write_object(num, body, store) -> None:
+        store[num] = out.tell()
+        out.write(b"%d 0 obj\n" % num + body + b"\nendobj\n")
+
+    # revision 1: 3 pages
+    write_object(1, b"<< /Type /Catalog /Pages 2 0 R >>", offsets)
+    write_object(2, b"<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 >>", offsets)
+    for num in (3, 4, 5):
+        write_object(
+            num, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 72 72] >>", offsets
+        )
+    xref1 = out.tell()
+    out.write(b"xref\n0 6\n")
+    out.write(b"0000000000 65535 f \n")
+    for num in range(1, 6):
+        out.write(b"%010d 00000 n \n" % offsets[num])
+    out.write(b"trailer\n<< /Size 6 /Root 1 0 R >>\n")
+    out.write(b"startxref\n%d\n%%%%EOF\n" % xref1)
+    # revision 2: a 4th page is added; the xref table is fully rewritten
+    # (starting at object 0) with every offset corrupted.
+    rev2_offsets = {}
+    write_object(
+        2, b"<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R 6 0 R] /Count 4 >>", rev2_offsets
+    )
+    write_object(
+        6, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 72 72] >>", rev2_offsets
+    )
+    xref2 = out.tell()
+    out.write(b"xref\n0 7\n")
+    out.write(b"0000000000 65535 f \n")
+    for num in range(1, 7):
+        offset = rev2_offsets[num] if num in rev2_offsets else offsets[num]
+        out.write(b"%010d 00000 n \n" % (offset + 100))  # corrupt every offset
+    out.write(b"trailer\n<< /Size 7 /Root 1 0 R /Prev %d >>\n" % xref1)
+    out.write(b"startxref\n%d\n%%%%EOF\n" % xref2)
+    return out.getvalue()
+
+
+def _objstm_pdf(with_endstream: bool, objstm_last: bool, with_endobj: bool = True) -> bytes:
+    """Class 3: PDF 1.5 file whose object stream has no /Length entry.
+
+    The pages (objects 3-5) live inside object stream 6. The stream data
+    is terminated by ``endstream`` (if ``with_endstream``) and/or the
+    object's ``endobj`` (if ``with_endobj``). With ``objstm_last`` the
+    object stream is the last object in the file, so no later ``endstream``
+    marker can be found while scanning forward.
+    """
+    out = BytesIO()
+    out.write(b"%PDF-1.5\n")
+    offsets = {}
+
+    def write_object(num, body) -> None:
+        offsets[num] = out.tell()
+        out.write(b"%d 0 obj\n" % num + body + b"\nendobj\n")
+
+    write_object(1, b"<< /Type /Catalog /Pages 2 0 R >>")
+    write_object(2, b"<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 >>")
+
+    inner = b""
+    index = []
+    pos = 0
+    for num in (3, 4, 5):
+        body = b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 72 72] >>"
+        index.append((num, pos))
+        inner += body + b" "
+        pos += len(body) + 1
+    header = b" ".join(b"%d %d" % (num, offset) for num, offset in index) + b" "
+    first = len(header)
+    stream_data = header + inner
+
+    def xref_stream_bytes(objstm_offset: int) -> bytes:
+        entries = [(0, 0, 0, 65535)]
+        entries += [(num, 1, offsets[num], 0) for num in (1, 2)]
+        entries.append((6, 1, objstm_offset, 0))
+        entries += [(num, 2, 6, idx) for idx, num in enumerate((3, 4, 5))]
+        entries.append((7, 1, offsets[7], 0))
+        entries.sort()
+        stream = b"".join(
+            bytes([entry_type]) + field2.to_bytes(4, "big") + field3.to_bytes(2, "big")
+            for _, entry_type, field2, field3 in entries
+        )
+        return (
+            b"7 0 obj\n<< /Type /XRef /Size 8 /W [1 4 2] /Root 1 0 R "
+            b"/Length %d >>\nstream\n" % len(stream)
+        ) + stream + b"\nendstream\nendobj\n"
+
+    def write_objstm() -> None:
+        offsets[6] = out.tell()
+        out.write(b"6 0 obj\n<< /Type /ObjStm /N 3 /First %d >>\nstream\n" % first)
+        out.write(stream_data)
+        out.write(b"\n")
+        if with_endstream:
+            out.write(b"endstream\n")
+        if with_endobj:
+            out.write(b"endobj\n")
+
+    if objstm_last:
+        offsets[7] = out.tell()
+        # The xref stream length does not depend on the offset values
+        # (fixed-width binary entries), so object 6's offset is known now.
+        offsets[6] = offsets[7] + len(xref_stream_bytes(0))
+        out.write(xref_stream_bytes(offsets[6]))
+        write_objstm()
+    else:
+        write_objstm()
+        offsets[7] = out.tell()
+        out.write(xref_stream_bytes(offsets[6]))
+    out.write(b"startxref\n%d\n%%%%EOF\n" % offsets[7])
+    return out.getvalue()
+
+
+def test_recover_truncated_tail_nonstrict():
+    """Class 1: a truncated tail (no %%EOF, no startxref, no trailer) is
+    fully recovered in non-strict mode and yields the correct page count.
+    """
+    reader = PdfReader(BytesIO(_pdf_with_truncated_tail()), strict=False)
+    assert len(reader.pages) == 3
+    assert reader.trailer["/Root"]["/Type"] == "/Catalog"
+
+
+def test_recover_truncated_tail_strict():
+    """The same truncated file must not be silently repaired in strict mode."""
+    with pytest.raises(PdfReadError, match="EOF marker not found"):
+        PdfReader(BytesIO(_pdf_with_truncated_tail()), strict=True)
+
+
+def test_recover_startxref_beyond_eof_nonstrict():
+    """A startxref offset pointing past the end of the file falls back to a
+    rebuilt xref table in non-strict mode.
+    """
+    reader = PdfReader(BytesIO(_pdf_with_startxref_beyond_eof()), strict=False)
+    assert len(reader.pages) == 3
+
+
+def test_recover_startxref_beyond_eof_strict():
+    with pytest.raises(PdfReadError, match="Broken xref table"):
+        PdfReader(BytesIO(_pdf_with_startxref_beyond_eof()), strict=True)
+
+
+@pytest.mark.parametrize("strict", [False, True])
+def test_unrecoverable_file_raises_pdfreaderror(strict):
+    """A file without any recoverable objects or trailer raises PdfReadError
+    itself, not a lower-level PdfStreamError/ParseError.
+    """
+    data = b"%PDF-1.4\nsome garbage that is not a PDF body\n"
+    with pytest.raises(PdfReadError) as excinfo:
+        PdfReader(BytesIO(data), strict=strict)
+    assert type(excinfo.value) is PdfReadError
+
+
+def test_recover_broken_xref_offsets_nonstrict():
+    """Class 2: wrong offsets in the last revision's xref table are repaired
+    from the objects found in the file; the live revision wins, so the page
+    count and /Root are consistent.
+    """
+    reader = PdfReader(BytesIO(_pdf_with_broken_xref_offsets()), strict=False)
+    assert len(reader.pages) == 4
+    assert reader.trailer["/Root"]["/Type"] == "/Catalog"
+    assert reader.trailer["/Root"]["/Pages"]["/Count"] == 4
+
+
+@pytest.mark.parametrize("objstm_last", [False, True])
+def test_recover_objstm_without_length_nonstrict(objstm_last):
+    """Class 3: an object stream without /Length is read in non-strict mode,
+    whether it is terminated by endstream or only by endobj.
+    """
+    reader = PdfReader(
+        BytesIO(_objstm_pdf(with_endstream=False, objstm_last=objstm_last)),
+        strict=False,
+    )
+    assert len(reader.pages) == 3
+
+
+def test_recover_objstm_without_length_but_endstream_nonstrict():
+    """Class 3 variant: no /Length but a proper endstream marker."""
+    reader = PdfReader(
+        BytesIO(_objstm_pdf(with_endstream=True, objstm_last=True)), strict=False
+    )
+    assert len(reader.pages) == 3
+
+
+def test_objstm_without_length_strict():
+    """A missing /Length is a spec violation; strict mode rejects it with a
+    PdfReadError (PdfStreamError is a PdfReadError subclass).
+    """
+    reader = PdfReader(
+        BytesIO(_objstm_pdf(with_endstream=False, objstm_last=True)),
+        strict=True,
+    )
+    with pytest.raises(PdfReadError):
+        len(reader.pages)
+
+
+def test_objstm_unterminated_is_unrecoverable():
+    """An object stream without /Length, endstream and endobj cannot be
+    recovered; the failure surfaces as PdfReadError, not a lower-level
+    PdfStreamError/ParseError.
+    """
+    data = _objstm_pdf(with_endstream=False, objstm_last=True, with_endobj=False)
+    reader = PdfReader(BytesIO(data), strict=False)
+    with pytest.raises(PdfReadError) as excinfo:
+        len(reader.pages)
+    assert type(excinfo.value) is PdfReadError
+
+
 @pytest.mark.parametrize(
     ("pdffile", "password", "should_fail"),
     [

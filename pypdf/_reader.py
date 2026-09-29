@@ -703,19 +703,35 @@ class PdfReader(PdfDocCommon):
         """
         self._basic_validation(stream)
         self._find_eof_marker(stream)
-        startxref = self._find_startxref_pos(stream)
-        self._startxref = startxref
+        startxref: Optional[int]
+        try:
+            startxref = self._find_startxref_pos(stream)
+        except PdfReadError:
+            if self.strict:
+                raise
+            # The startxref pointer cannot be located at all (e.g. the tail
+            # of the file was truncated). Fall back to rebuilding the
+            # cross-reference table from scratch in
+            # _read_xref_tables_and_trailers().
+            logger_warning(
+                "startxref not found, attempting to rebuild xref table",
+                source=__name__,
+            )
+            startxref = None
+        self._startxref = startxref if startxref is not None else -1
 
         # check and eventually correct the startxref only if not strict
-        xref_issue_nr = self._get_xref_issues(stream, startxref)
-        if xref_issue_nr != 0:
-            if self.strict and xref_issue_nr:
-                raise PdfReadError("Broken xref table")
-            logger_warning(
-                "incorrect startxref pointer(%(xref_issue_nr)d)",
-                source=__name__,
-                xref_issue_nr=xref_issue_nr,
-            )
+        xref_issue_nr = 0
+        if startxref is not None:
+            xref_issue_nr = self._get_xref_issues(stream, startxref)
+            if xref_issue_nr != 0:
+                if self.strict and xref_issue_nr:
+                    raise PdfReadError("Broken xref table")
+                logger_warning(
+                    "incorrect startxref pointer(%(xref_issue_nr)d)",
+                    source=__name__,
+                    xref_issue_nr=xref_issue_nr,
+                )
 
         # read all cross-reference tables and their trailers
         self._read_xref_tables_and_trailers(stream, startxref, xref_issue_nr)
@@ -747,6 +763,11 @@ class PdfReader(PdfDocCommon):
         # remove wrong objects (not pointing to correct structures) - cf #2326
         if not self.strict:
             loc = stream.tell()
+            # Maps (id, generation) to the offset of the object's last
+            # occurrence in the file; built lazily on the first
+            # wrong-pointing entry. The last occurrence is the one the
+            # most recent revision refers to.
+            recovery_offsets: Optional[dict[tuple[int, int], int]] = None
             for gen, xref_entry in self.xref.items():
                 if gen == 65535:
                     continue
@@ -756,14 +777,35 @@ class PdfReader(PdfDocCommon):
                     try:
                         self.read_object_header(stream)
                     except ValueError:
-                        logger_warning(
-                            "Ignoring wrong pointing object %(id)d %(gen)d (offset %(offset)d)",
-                            source=__name__,
-                            id=id,
-                            gen=gen,
-                            offset=xref_entry[id],
-                        )
-                        del xref_entry[id]  # we can delete the id, we are parsing ids
+                        if recovery_offsets is None:
+                            recovery_offsets = {}
+                            if hasattr(stream, "getbuffer"):
+                                stream_data = bytes(stream.getbuffer())
+                            else:
+                                stream.seek(0, 0)
+                                stream_data = stream.read(-1)
+                            for obj_num, obj_gen, obj_start in self._find_pdf_objects(stream_data):
+                                recovery_offsets[(obj_num, obj_gen)] = obj_start
+                        if (id, gen) in recovery_offsets:
+                            # The object can still be located in the file;
+                            # repair the entry instead of dropping it.
+                            logger_warning(
+                                "Incorrect offset for object %(id)d %(gen)d (offset %(offset)d), repaired",
+                                source=__name__,
+                                id=id,
+                                gen=gen,
+                                offset=xref_entry[id],
+                            )
+                            xref_entry[id] = recovery_offsets[(id, gen)]
+                        else:
+                            logger_warning(
+                                "Ignoring wrong pointing object %(id)d %(gen)d (offset %(offset)d)",
+                                source=__name__,
+                                id=id,
+                                gen=gen,
+                                offset=xref_entry[id],
+                            )
+                            del xref_entry[id]  # we can delete the id, we are parsing ids
             stream.seek(loc, 0)  # return to where it was
 
     def _basic_validation(self, stream: StreamType) -> None:
@@ -815,6 +857,12 @@ class PdfReader(PdfDocCommon):
                 if self.strict:
                     raise PdfReadError("EOF marker not found")
                 logger_warning("EOF marker not found", source=__name__)
+                # The file contains no %%EOF marker at all (e.g. it was
+                # truncated). Stop the backwards scan here and reposition
+                # to the end of the stream so that the startxref search
+                # starts from the actual tail of the file.
+                stream.seek(0, os.SEEK_END)
+                return
             line = read_previous_line(stream)
 
     def _find_startxref_pos(self, stream: StreamType) -> int:
@@ -1017,7 +1065,7 @@ class PdfReader(PdfDocCommon):
                             source=__name__,
                             num=num,
                         )
-                        generation, offset = recovery_cache[num]
+                        offset, generation = recovery_cache[num]
                         entry_type_b = b"n"
 
                 if generation not in self.xref:
@@ -1068,6 +1116,15 @@ class PdfReader(PdfDocCommon):
         self.xref_free_entry = {}
         self.xref_objStm = {}
         self.trailer = DictionaryObject()
+        if startxref is None:
+            # The startxref pointer could not be located at all (e.g. the
+            # tail of the file was truncated); rebuild the cross-reference
+            # table from the objects found in the file. Without any usable
+            # trailer or catalog the file is not recoverable.
+            self._rebuild_xref_table(stream)
+            if TK.ROOT not in self.trailer:
+                raise PdfReadError("startxref not found")
+            return
         visited_xref_offsets: set[int] = set()
         while startxref is not None:
             # Detect circular /Prev references in the xref chain
@@ -1399,6 +1456,10 @@ class PdfReader(PdfDocCommon):
         # stream instead of behind a `trailer` keyword. Collect them here,
         # keyed by their offset, to merge them below in file order.
         xref_stream_trailers: list[tuple[int, DictionaryObject]] = []
+        # Last object (in file order) found to be a /Catalog; used to
+        # synthesize a /Root entry when no trailer provides one (e.g. the
+        # trailer was truncated away).
+        catalog: Optional[tuple[int, int]] = None
         for generation_number in self.xref:
             for object_number in self.xref[generation_number]:
                 # get_object in manual
@@ -1414,6 +1475,9 @@ class PdfReader(PdfDocCommon):
                             if key in obj:
                                 trailer[NameObject(key)] = obj.raw_get(key)
                         xref_stream_trailers.append((object_start, trailer))
+                        continue
+                    if object_type == "/Catalog":
+                        catalog = (object_number, generation_number)
                         continue
                     if object_type != "/ObjStm":
                         continue
@@ -1466,6 +1530,17 @@ class PdfReader(PdfDocCommon):
         for _, new_trailer in sorted(trailers, key=itemgetter(0)):
             for key, value in new_trailer.items():
                 self.trailer[key] = value
+        if TK.ROOT not in self.trailer and catalog is not None:
+            logger_warning(
+                "No /Root entry found in any trailer, "
+                "using catalog object %(object_number)d %(generation_number)d",
+                source=__name__,
+                object_number=catalog[0],
+                generation_number=catalog[1],
+            )
+            self.trailer[NameObject(TK.ROOT)] = IndirectObject(
+                catalog[0], catalog[1], self
+            )
 
     def _read_xref_subsections(
         self,

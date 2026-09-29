@@ -567,13 +567,24 @@ class DictionaryObject(dict[Any, Any], PdfObject):
         # Read until the next object position.
         read_value = stream.read(bytes_to_read)
         endstream_position = read_value.find(b"endstream")
-        if endstream_position < 0:
-            raise PdfReadError(
-                f"Unable to find 'endstream' marker for obj starting at {current_position}."
+        if endstream_position >= 0:
+            # 9 = len(b"endstream")
+            stream.seek(current_position + endstream_position + 9)
+            return read_value[: endstream_position - 1]
+        # Some producers omit the 'endstream' marker altogether and let
+        # 'endobj' terminate the stream data.
+        endobj_position = read_value.find(b"endobj")
+        if endobj_position >= 0:
+            logger_warning(
+                "Stream data is terminated by 'endobj' without an 'endstream' marker",
+                source=__name__,
             )
-        # 9 = len(b"endstream")
-        stream.seek(current_position + endstream_position + 9)
-        return read_value[: endstream_position - 1]
+            # 6 = len(b"endobj")
+            stream.seek(current_position + endobj_position + 6)
+            return read_value[:endobj_position].rstrip(b"\r\n")
+        raise PdfReadError(
+            f"Unable to find 'endstream' marker for obj starting at {current_position}."
+        )
 
     @staticmethod
     def read_from_stream(

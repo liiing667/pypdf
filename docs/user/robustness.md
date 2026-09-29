@@ -48,3 +48,26 @@ not follow the specification.
 Choosing `strict=False` means that pypdf will try to be forgiving and do
 something reasonable, but it will log a warning message. It is a best-effort
 approach.
+
+## Error recovery in PdfReader
+
+With `strict=False` (the default), `PdfReader` attempts to recover from the
+following kinds of damage before giving up:
+
+* A missing or truncated `%%EOF` marker or `startxref` pointer: the
+  cross-reference table is rebuilt by scanning the file for indirect objects.
+  If no trailer dictionary survives, the document catalog is located via its
+  `/Type /Catalog` entry and used as `/Root`.
+* A `startxref` offset pointing outside the file: the cross-reference table
+  is rebuilt as described above.
+* Wrong object offsets in the cross-reference table: entries are repaired
+  from the objects found in the file (the last occurrence of each object
+  wins); only objects that cannot be found at all are dropped.
+* A stream object without a `/Length` entry: the stream data is read up to
+  the next `endstream` or `endobj` marker.
+
+If none of this yields a usable document, `PdfReader` raises
+{class}`~pypdf.errors.PdfReadError`.
+
+With `strict=True`, none of these repairs are attempted and the first
+violation raises an exception.
